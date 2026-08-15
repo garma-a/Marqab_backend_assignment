@@ -1,0 +1,10 @@
+node_modules/
+coverage/
+.env
+.env.*
+!.env.example
+dist/
+*.log
+.DS_Store
+TASK-english.md
+solutionNotes.md

@@ -1,0 +1,32 @@
+{
+  "name": "signal-continuity-backend-assessment",
+  "version": "1.0.0",
+  "private": true,
+  "description": "An anonymized backend assessment for ordered temporal signals and append-only decisions.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test:smoke": "vitest run --config vitest.smoke.config.ts",
+    "test": "vitest run --config vitest.config.ts",
+    "test:watch": "vitest --config vitest.config.ts",
+    "test:db": "vitest run --config vitest.db.config.ts",
+    "db:up": "docker compose up -d --wait postgres",
+    "db:down": "docker compose down -v",
+    "db:reset": "docker compose down -v && docker compose up -d --wait postgres && tsx scripts/migrate.ts",
+    "db:migrate": "tsx scripts/migrate.ts",
+    "verify": "npm run typecheck && npm run test:smoke && npm run test && npm run test:db"
+  },
+  "dependencies": {
+    "pg": "^8.16.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.17",
+    "@types/pg": "^8.15.5",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "vitest": "^4.0.0"
+  }
+}
