@@ -12,5 +12,13 @@ export type FingerprintInput = {
  * is canonical and independent from request-arrival order.
  */
 export function decisionFingerprint(input: FingerprintInput): string {
-  return createHash('sha256').update(JSON.stringify(input)).digest('hex');
+  const canonical = {
+    seriesKey: input.seriesKey,
+    evaluation: {
+      ...input.evaluation,
+      inputEventIds: [...input.evaluation.inputEventIds].sort(),
+    },
+    rule: input.rule,
+  };
+  return createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
 }
