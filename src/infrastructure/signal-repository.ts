@@ -164,7 +164,7 @@ export class SignalRepository {
            rule_id, rule_version, input_event_ids,
            window_started_at, window_ended_at, outcome,
            decision_fingerprint, supersedes_decision_id, decision_kind
-         ) values ($1, $2, $3, $4, $5, $6, $7::text[], $8, $9, $10, $11, null, 'ORIGINAL')
+         ) values ($1, $2, $3, $4, $5, $6, $7::text[], $8, $9, $10, $11, $12, $13)
          returning id`,
         [
           event.tenantId,
@@ -178,6 +178,8 @@ export class SignalRepository {
           evaluation.windowEndedAt,
           evaluation.outcome,
           fingerprint,
+          supersedesDecisionId,
+          decisionKind,
         ],
       );
 
@@ -228,8 +230,108 @@ export class SignalRepository {
     }
   }
 
-  public async replay(_decisionId: string): Promise<ReplayResult> {
-    throw new Error('REPLAY_NOT_IMPLEMENTED');
+  public async replay(decisionId: string): Promise<ReplayResult> {
+    const client = await this.pool.connect();
+    try {
+      // get back the decision record with the series key and the rule definition on that time
+      const decResult = await client.query<{
+        tenant_id: string;
+        scope_id: string;
+        source_id: string;
+        signal_code: string;
+        rule_id: string;
+        rule_version: number;
+        input_event_ids: string[];
+        outcome: 'UNCONFIRMED' | 'CONFIRMED';
+        decision_fingerprint: string;
+        window_ended_at: Date | null;
+      }>(
+        `select tenant_id, scope_id, source_id, signal_code,
+                       rule_id, rule_version, input_event_ids,
+                       outcome, decision_fingerprint, window_ended_at
+                from decision_records
+                where id = $1`,
+        [decisionId],
+      );
+      const storedDecision = decResult.rows[0];
+      if (!storedDecision) {
+        throw new Error(`DECISION_NOT_FOUND: ${decisionId}`);
+      }
+      // i need the rule that was applied on the time of the decision
+      const ruleResult = await client.query<{ definition: RuleDefinition }>(
+        `select definition from rule_versions
+                where rule_id = $1 and version = $2`,
+        [storedDecision.rule_id, storedDecision.rule_version],
+      );
+
+      const historicalRule = ruleResult.rows[0]?.definition;
+      if (!historicalRule) {
+        throw new Error(
+          `RULE_VERSION_NOT_FOUND: ${storedDecision.rule_id} v${storedDecision.rule_version}`,
+        );
+      }
+
+      // i need the events that were stored for this series with input_event_ids
+      const eventsResult = await client.query<{
+        tenant_id: string;
+        scope_id: string;
+        source_id: string;
+        signal_code: string;
+        event_id: string;
+        observed_at: Date;
+        received_at: Date;
+        value: string;
+      }>(
+        `select tenant_id, scope_id, source_id, signal_code, event_id,
+                       observed_at, received_at, value
+                from signal_events
+                where tenant_id = $1 and scope_id = $2 and source_id = $3 and signal_code = $4
+                  and event_id = any($5::text[])  
+                order by observed_at asc, event_id asc`,
+        [
+          storedDecision.tenant_id,
+          storedDecision.scope_id,
+          storedDecision.source_id,
+          storedDecision.signal_code,
+          storedDecision.input_event_ids,
+        ],
+      );
+      const events: SignalEvent[] = eventsResult.rows.map((row) => ({
+        tenantId: row.tenant_id,
+        scopeId: row.scope_id,
+        sourceId: row.source_id,
+        signalCode: row.signal_code,
+        eventId: row.event_id,
+        observedAt: row.observed_at.toISOString(),
+        receivedAt: row.received_at.toISOString(),
+        value: Number(row.value),
+      }));
+
+      // recompute the evaluation
+      const evaluation = evaluateTemporalSeries(events, historicalRule);
+
+      // compute the canonical fingerprint
+      const computedFingerprint = decisionFingerprint({
+        seriesKey: {
+          tenantId: storedDecision.tenant_id,
+          scopeId: storedDecision.scope_id,
+          sourceId: storedDecision.source_id,
+          signalCode: storedDecision.signal_code,
+        },
+        rule: historicalRule,
+        evaluation,
+      });
+      return {
+        decisionId,
+        outcome: evaluation.outcome,
+        decisionFingerprint: computedFingerprint,
+        matchedStoredDecision:
+          evaluation.outcome === storedDecision.outcome &&
+          computedFingerprint === storedDecision.decision_fingerprint,
+      };
+    } finally {
+      client.release();
+    }
   }
 
   private async findEvent(
@@ -291,6 +393,7 @@ export class SignalRepository {
               observed_at, received_at, value
        from signal_events
        where tenant_id = $1 and scope_id = $2 and source_id = $3 and signal_code = $4
+and lateness_status in ('ON_TIME', 'LATE')
        order by observed_at asc, event_id asc`,
       [event.tenantId, event.scopeId, event.sourceId, event.signalCode],
     );
