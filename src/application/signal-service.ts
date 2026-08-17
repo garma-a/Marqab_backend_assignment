@@ -38,7 +38,10 @@ function validateEvent(event: SignalEvent): void {
   if (!Number.isFinite(event.value)) {
     throw new Error('value must be finite');
   }
-  if (!Number.isFinite(Date.parse(event.observedAt)) || !Number.isFinite(Date.parse(event.receivedAt))) {
+  if (
+    !Number.isFinite(Date.parse(event.observedAt)) ||
+    !Number.isFinite(Date.parse(event.receivedAt))
+  ) {
     throw new Error('observedAt and receivedAt must be valid ISO timestamps');
   }
 }
