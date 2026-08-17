@@ -11,6 +11,7 @@ export type SignalEvent = {
 
 export type RuleOperator = 'GT' | 'GTE';
 export type DurationComparator = 'GT' | 'GTE';
+export type LatenessStatus = 'ON_TIME' | 'LATE' | 'TOO_LATE';
 
 export type RuleDefinition = {
   ruleId: string;
