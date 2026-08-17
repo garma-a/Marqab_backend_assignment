@@ -3,6 +3,7 @@ import type pg from 'pg';
 import { decisionFingerprint } from '../domain/fingerprint.js';
 import { evaluateTemporalSeries } from '../domain/temporal-engine.js';
 import {
+  LatenessStatus,
   seriesKeyOf,
   type IngestResult,
   type ReplayResult,
@@ -61,6 +62,11 @@ export class SignalRepository {
         if (!existing) {
           throw new Error('EVENT_INSERT_CONFLICT_WITHOUT_ROW');
         }
+        if (existing.contentHash !== contentHash) {
+          throw new Error(
+            `EVENT_ID_CONFLICT: eventId ${event.eventId} exists with different immutable content`,
+          );
+        }
         await client.query('commit');
         return {
           status: 'DUPLICATE',
@@ -74,6 +80,61 @@ export class SignalRepository {
       if (!eventRowId) {
         throw new Error('EVENT_INSERT_DID_NOT_RETURN_ID');
       }
+      // i need to make sure the series heads exist before i can insert the events
+      await client.query(
+        `insert into series_heads (tenant_id, scope_id, source_id, signal_code, watermark_at)
+                values ($1, $2, $3, $4, null)
+                on conflict (tenant_id, scope_id, source_id, signal_code) do nothing`,
+        [event.tenantId, event.scopeId, event.sourceId, event.signalCode],
+      );
+      // now i need to retrieve the watermark timestamp to decide based on it the late and on time status
+      const headResult = await client.query<{ watermark_at: Date | null }>(
+        `select watermark_at from series_heads
+                where tenant_id = $1 and scope_id = $2 and source_id = $3 and signal_code = $4
+                for update`,
+        [event.tenantId, event.scopeId, event.sourceId, event.signalCode],
+      );
+      const watermarkAt = headResult.rows[0]?.watermark_at ?? null;
+      const observedMs = Date.parse(event.observedAt);
+      let latenessStatus: LatenessStatus = 'ON_TIME';
+
+      if (watermarkAt != null) {
+        const watermarkMs = watermarkAt.getTime();
+        if (observedMs < watermarkMs) {
+          const latenessMs = watermarkMs - observedMs;
+          if (latenessMs <= rule.allowedLatenessMs) {
+            latenessStatus = 'LATE';
+          } else {
+            latenessStatus = 'TOO_LATE';
+          }
+        }
+      }
+      // update lateness status on the event row
+      await client.query(`update signal_events set lateness_status = $1 where id = $2`, [
+        latenessStatus,
+        eventRowId,
+      ]);
+
+      // if TOO_LATE: commit and return early no live state
+      if (latenessStatus === 'TOO_LATE') {
+        await client.query('commit');
+        return {
+          status: 'TOO_LATE',
+          eventRowId,
+          decisionId: null,
+          outcome: null,
+        };
+      }
+
+      // if ON_TIME  update the watermark timestamp to reflect the new timestamp
+      if (latenessStatus === 'ON_TIME') {
+        await client.query(
+          `update series_heads
+                  set watermark_at = $1, updated_at = clock_timestamp()
+                  where tenant_id = $2 and scope_id = $3 and source_id = $4 and signal_code = $5`,
+          [event.observedAt, event.tenantId, event.scopeId, event.sourceId, event.signalCode],
+        );
+      }
 
       const seriesEvents = await this.listSeriesEvents(client, event);
       const evaluation = evaluateTemporalSeries(seriesEvents, rule);
@@ -82,6 +143,18 @@ export class SignalRepository {
         rule,
         evaluation,
       });
+
+      // i need the decision id to decide if i need to create a correction or not
+      const prevState = await client.query<{ decision_id: string }>(
+        `select decision_id from current_signal_state
+              where tenant_id = $1 and scope_id = $2 and source_id = $3 and signal_code = $4`,
+        [event.tenantId, event.scopeId, event.sourceId, event.signalCode],
+      );
+
+      const previousDecisionId = prevState.rows[0]?.decision_id ?? null;
+      const decisionKind =
+        latenessStatus === 'LATE' && previousDecisionId != null ? 'CORRECTION' : 'ORIGINAL';
+      const supersedesDecisionId = decisionKind === 'CORRECTION' ? previousDecisionId : null;
 
       // TODO: Re-evaluation and correction semantics are incomplete. The
       // starter stores every new result as an original decision.
@@ -159,7 +232,10 @@ export class SignalRepository {
     throw new Error('REPLAY_NOT_IMPLEMENTED');
   }
 
-  private async findEvent(client: pg.PoolClient, event: SignalEvent): Promise<StoredSignalEvent | null> {
+  private async findEvent(
+    client: pg.PoolClient,
+    event: SignalEvent,
+  ): Promise<StoredSignalEvent | null> {
     const result = await client.query<{
       id: string;
       tenant_id: string;
@@ -197,7 +273,10 @@ export class SignalRepository {
     };
   }
 
-  private async listSeriesEvents(client: pg.PoolClient, event: SignalEvent): Promise<SignalEvent[]> {
+  private async listSeriesEvents(
+    client: pg.PoolClient,
+    event: SignalEvent,
+  ): Promise<SignalEvent[]> {
     const result = await client.query<{
       tenant_id: string;
       scope_id: string;
@@ -212,7 +291,7 @@ export class SignalRepository {
               observed_at, received_at, value
        from signal_events
        where tenant_id = $1 and scope_id = $2 and source_id = $3 and signal_code = $4
-       order by received_at asc, event_id asc`,
+       order by observed_at asc, event_id asc`,
       [event.tenantId, event.scopeId, event.sourceId, event.signalCode],
     );
 
